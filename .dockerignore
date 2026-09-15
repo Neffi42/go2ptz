@@ -1,0 +1,12 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+LICENSE
+mise.toml
+.idea/
+.vscode/
+.DS_Store
+*.swp
+go2ptz
