@@ -10,3 +10,9 @@ mise.toml
 .DS_Store
 *.swp
 go2ptz
+.env
+.env.example
+compose.yaml
+.forgejo/
+.claude/
+AGENTS.md

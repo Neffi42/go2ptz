@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+env:
+  PLATFORMS: linux/amd64,linux/arm64
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    # dind sidecar: bind mounts land on it, so all Go work runs inside docker build.
+    runs-on: docker
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+
+      # The sidecar's readiness probe does not gate the job container.
+      - name: Wait for Docker daemon
+        run: timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+
+      - name: Set image name
+        env:
+          SERVER_URL: ${{ forgejo.server_url }}
+          REPOSITORY: ${{ forgejo.repository }}
+        run: |
+          registry="${SERVER_URL#*://}"
+          repo="$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "REGISTRY=$registry"
+            echo "IMAGE=$registry/$repo"
+            echo "NATIVE_PLATFORM=linux/$(docker version --format '{{.Server.Arch}}')"
+          } >> "$GITHUB_ENV"
+
+      - name: Registry login
+        env:
+          REGISTRY_USER: ${{ forgejo.actor }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "REGISTRY_TOKEN not set: building without registry cache"
+            exit 0
+          fi
+          echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+          # /var/lib/docker is an emptyDir, so the registry is the only cache between jobs.
+          echo "CACHE_REF=$IMAGE:buildcache" >> "$GITHUB_ENV"
+
+      # buildx cannot create a builder from TLS env vars, only from a context.
+      - name: Set up buildx
+        run: |
+          certs="${DOCKER_CERT_PATH:-$HOME/.docker}"
+          docker context create dind \
+            --docker "host=$DOCKER_HOST,ca=$certs/ca.pem,cert=$certs/cert.pem,key=$certs/key.pem"
+          docker buildx create dind --name builder --driver docker-container --use --bootstrap
+
+      - name: gofmt, go vet, go test
+        run: |
+          cache=()
+          [ -n "${CACHE_REF:-}" ] && cache=(--cache-from "type=registry,ref=$CACHE_REF")
+          docker buildx build --progress plain --platform "$NATIVE_PLATFORM" --target test "${cache[@]}" .
+
+      - name: Build image, publish on release
+        env:
+          EVENT: ${{ forgejo.event_name }}
+          TAG: ${{ forgejo.event.release.tag_name }}
+          PRERELEASE: ${{ forgejo.event.release.prerelease }}
+          SOURCE: ${{ forgejo.server_url }}/${{ forgejo.repository }}
+          REVISION: ${{ forgejo.sha }}
+        run: |
+          args=(--progress plain --platform "$PLATFORMS"
+            --label "org.opencontainers.image.source=$SOURCE"
+            --label "org.opencontainers.image.revision=$REVISION")
+          # Forgejo's registry rejects buildkit's default cache index type.
+          if [ -n "${CACHE_REF:-}" ]; then
+            args+=(--cache-from "type=registry,ref=$CACHE_REF"
+              --cache-to "type=registry,ref=$CACHE_REF,mode=max,image-manifest=true,oci-mediatypes=true")
+          fi
+          if [ "$EVENT" = release ]; then
+            [ -n "${CACHE_REF:-}" ] || { echo "REGISTRY_TOKEN is required to publish"; exit 1; }
+            case "$TAG" in
+              v*) ;;
+              *) echo "release tag $TAG does not start with v"; exit 1 ;;
+            esac
+            version="${TAG#v}"
+            args+=(--push -t "$IMAGE:$version"
+              --label "org.opencontainers.image.version=$version")
+            # Prereleases and suffixed versions don't move latest.
+            if [ "$PRERELEASE" != true ] && echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              args+=(-t "$IMAGE:latest")
+            fi
+          fi
+          docker buildx build "${args[@]}" .
