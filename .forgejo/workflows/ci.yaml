@@ -49,7 +49,8 @@ jobs:
           fi
           echo "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
           # /var/lib/docker is an emptyDir, so the registry is the only cache between jobs.
-          echo "CACHE_REF=$IMAGE:buildcache" >> "$GITHUB_ENV"
+          # Separate package: a cache tag on $IMAGE would show up as its latest version.
+          echo "CACHE_REF=$IMAGE-cache:buildcache" >> "$GITHUB_ENV"
 
       # buildx cannot create a builder from TLS env vars, only from a context.
       - name: Set up buildx
@@ -96,3 +97,36 @@ jobs:
             fi
           fi
           docker buildx build "${args[@]}" .
+
+      # Packages belong to the owner, not the repo: link it so it shows in the repo's Packages tab.
+      - name: Link package to repository
+        if: forgejo.event_name == 'release'
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          API: ${{ forgejo.api_url }}
+          OWNER: ${{ forgejo.repository_owner }}
+          NAME: ${{ forgejo.event.repository.name }}
+          TAG: ${{ forgejo.event.release.tag_name }}
+        run: |
+          pkg="$API/packages/$OWNER/container/${IMAGE##*/}"
+          repo=$(curl -fsS -H "Authorization: token $TOKEN" "$pkg/${TAG#v}" | jq -r '.repository.name // empty')
+          if [ -z "$repo" ]; then
+            curl -fsS -X POST -H "Authorization: token $TOKEN" "$pkg/-/link/$NAME"
+          fi
+
+      - name: Add image to release notes
+        if: forgejo.event_name == 'release'
+        env:
+          TOKEN: ${{ forgejo.token }}
+          API: ${{ forgejo.api_url }}/repos/${{ forgejo.repository }}/releases/${{ forgejo.event.release.id }}
+          TAG: ${{ forgejo.event.release.tag_name }}
+        run: |
+          ref="$IMAGE:${TAG#v}"
+          body=$(curl -fsS -H "Authorization: token $TOKEN" "$API" | jq -r '.body // ""')
+          # Re-runs must not append twice.
+          case "$body" in *"## Container image"*) exit 0 ;; esac
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)
+          note=$(printf '\n\n## Container image\n\n```\ndocker pull %s\n```\n\nDigest: `%s`\nPlatforms: `%s`\n' \
+            "$ref" "$digest" "$PLATFORMS")
+          jq -n --arg b "$body$note" '{body: $b}' \
+            | curl -fsS -X PATCH -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' -d @- "$API" >/dev/null
